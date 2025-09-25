@@ -1,52 +1,29 @@
-<!-- 
-    Using Buffered gpt.js events initially. 
-    In the case rendered size is 1x1, rely on prebid.js events and find the actual size rendered.
--->
-
 <script>
 (function () {
-  // ======= CONFIG =======
-  const DEBUG = window.ayManagerEnv.debug.flags[0] === 'true' || false; // set to false to silence all logs, or manually override
+  const DEBUG = window.ayManagerEnv.debug.flags[0] === 'true' || false;
 
-  // ======= tiny logger =======
   function log(){ if (DEBUG && window.console) console.log.apply(console, arguments); }
 
-  // ======= attach once =======
   if (window.__SN_GPT_PREBID_BUFFER_ATTACHED__) return;
   window.__SN_GPT_PREBID_BUFFER_ATTACHED__ = true;
 
-  // ======= public surface =======
-  // Primary namespace is now window.stepnetwork (lowercase) to reduce collisions.
-  // Backward compatibility: window.SN still points to the same object if previously used.
   window.stepnetwork = window.stepnetwork || {};
-  const SN = window.stepnetwork; // internal reference stays SN for minimal code changes
-  // Legacy alias (do not overwrite an existing distinct object)
-  if (!window.SN) {
-    window.SN = SN;
+
+  function trackAdEvent(kind, payload) {
+    /* 
+    
+    GA4 invoke or function for event here
+    
+    */
+
+    if (DEBUG) log('[SN][Track]', kind, payload);
   }
+  window.stepnetwork.trackAdEvent = trackAdEvent;
 
-  SN.gptEvents = [];          // raw GPT events
-  SN.pbEvents  = [];          // raw Prebid events
-  SN.flush     = flush;       // callable anytime, returns summary
-  SN.dump      = () => ({ gpt: SN.gptEvents.slice(), pb: SN.pbEvents.slice() });
-
-  // ======= rules config =======
   const TOPSCROLL_TOKEN = 'div-gpt-ad-topscroll';
   const INTERSTITIAL_TOKEN = 'interstitial';
-  const ALLOWED_MIDSCROLL_SIZES = [
-    [300, 240],
-    [300, 210],
-    [970, 570],
-    [970, 550],
-    [970, 540]
-  ];
+  const ALLOWED_MIDSCROLL_SIZES = [[300,240],[300,210],[970,570],[970,550],[970,540]];
 
-  // ======= stubs (intentionally empty; log when DEBUG) =======
-  function topscrollEvent(payload)    { log('[SN][Topscroll Event]', payload); }
-  function interstitialEvent(payload) { log('[SN][Interstitial Event]', payload); }
-  function midscrollEvent(payload)    { log('[SN][Midscroll Event]', payload); }
-
-  // ======= utils =======
   const now = () => (performance && performance.now) ? Math.round(performance.now()) : Date.now();
   const sizeEq = (a,b) => Array.isArray(a)&&Array.isArray(b)&&a[0]===b[0]&&a[1]===b[1];
   const is11   = (a) => Array.isArray(a) && a[0] === 1 && a[1] === 1;
@@ -61,26 +38,53 @@
     };
   }
 
-  // If Prebid adUnitCode !== GPT element id, adapt this mapping.
   function mapAdUnitCodeToElementId(adUnitCode) {
     return adUnitCode || '';
   }
 
-  // ======= capture GPT events =======
+  const pbCache = Object.create(null);
+  function pushPbEvent(elId, ev) {
+    if (!elId) return;
+    (pbCache[elId] || (pbCache[elId] = [])).push(ev);
+  }
+
+  function findCorrelatedPrebidSize(elId) {
+    if (!elId) return null;
+    let arr = pbCache[elId];
+    if (!arr) {
+      // Fuzzy fallback: find first key that includes elId or is included by elId
+      const keys = Object.keys(pbCache);
+      for (let k of keys) {
+        if (k.includes(elId) || elId.includes(k)) { arr = pbCache[k]; break; }
+      }
+    }
+    if (!arr || !arr.length) return null;
+    // Reverse scan: prefer adRenderSucceeded over bidWon by first encountered in reverse order
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const ev = arr[i];
+      if (ev.type === 'adRenderSucceeded' && Array.isArray(ev.size)) return ev.size;
+    }
+    // Fallback: any bidWon with size
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const ev = arr[i];
+      if (ev.type === 'bidWon' && Array.isArray(ev.size)) return ev.size;
+    }
+    return null;
+  }
+
   window.googletag = window.googletag || { cmd: [] };
-  log('[SN][Attach] registering GPT + Prebid buffers…');
 
   googletag.cmd.push(function () {
     const pubads = googletag.pubads();
 
-    function recordGPT(type, e) {
+    function buildBase(e, typeOverride) {
       const { path, elId } = normSlot(e);
       const size = Array.isArray(e.size) ? e.size : null;
-      const entry = {
+      return {
         t: now(),
-        type,
+        type: typeOverride || e.type || null,
         path: path || null,
-        elId:  elId  || null,
+        elId: elId || null,
         isEmpty: !!e.isEmpty,
         size,
         size_str: toStr(size),
@@ -90,18 +94,56 @@
         campaignId: e.campaignId || null,
         serviceName: e.serviceName || null
       };
-      SN.gptEvents.push(entry);
-      log(`[SN][GPT][${type}]`, entry);
     }
 
-    pubads.addEventListener('slotRequested',        (e) => recordGPT('slotRequested', e));
-    pubads.addEventListener('slotResponseReceived', (e) => recordGPT('slotResponseReceived', e));
-    pubads.addEventListener('slotRenderEnded',      (e) => recordGPT('slotRenderEnded', e));
-    pubads.addEventListener('impressionViewable',   (e) => recordGPT('impressionViewable', e));
-    pubads.addEventListener('slotOnload',           (e) => recordGPT('slotOnload', e));
+    function effectiveSize(base) {
+      if (Array.isArray(base.size) && !is11(base.size)) return base.size; // GPT gave real size
+      if (!base.elId) return base.size; // no element id => cannot correlate
+      const corr = findCorrelatedPrebidSize(base.elId);
+      return corr || base.size;
+    }
+
+    function classifyAndTrack(base, gptEventName) {
+      // Only evaluate on slotRenderEnded (non-empty) and slotOnload for interstitial.
+      const lowerPath = (base.path || '').toLowerCase();
+      const matches = [];
+
+      if (gptEventName === 'slotRenderEnded' && !base.isEmpty) {
+        // topscroll
+        if (lowerPath.includes('topscroll') || (base.elId && base.elId.includes(TOPSCROLL_TOKEN))) {
+          matches.push('topscroll');
+        }
+        // midscroll (by effective size)
+        const eff = effectiveSize(base);
+        if (Array.isArray(eff) && inAllow(eff)) {
+          matches.push('midscroll');
+          base.effectiveSize = eff;
+          base.effectiveSizeStr = toStr(eff);
+        }
+        // interstitial
+        if (lowerPath.includes(INTERSTITIAL_TOKEN)) {
+          matches.push('interstitial');
+        }
+      } else if (gptEventName === 'slotOnload') {
+        if (lowerPath.includes(INTERSTITIAL_TOKEN)) {
+          matches.push('interstitial');
+        }
+      }
+
+      matches.forEach(kind => trackAdEvent(kind, base));
+    }
+
+    function handleRenderLike(name) {
+      return (e) => {
+        const base = buildBase(e, name);
+        classifyAndTrack(base, name);
+      };
+    }
+
+    pubads.addEventListener('slotRenderEnded', handleRenderLike('slotRenderEnded'));
+    pubads.addEventListener('slotOnload',      handleRenderLike('slotOnload'));
   });
 
-  // ======= capture Prebid events =======
   onPrebidReady(function () {
     try {
       safeOn('adRenderSucceeded', function (ev) {
@@ -110,15 +152,11 @@
         const entry = {
           t: now(),
           type: 'adRenderSucceeded',
-          elId: elId || null,
           size,
-          size_str: toStr(size),
-          adUnitCode: ev.adUnitCode || null,
           bidder: ev.bidder || ev.bidderCode || null,
           adId: ev.adId || null
         };
-        SN.pbEvents.push(entry);
-        log('[SN][PB][adRenderSucceeded]', entry);
+        pushPbEvent(elId, entry);
       });
 
       safeOn('bidWon', function (ev) {
@@ -127,18 +165,13 @@
         const entry = {
           t: now(),
           type: 'bidWon',
-          elId: elId || null,
           size,
-          size_str: toStr(size),
-          adUnitCode: ev.adUnitCode || null,
           bidder: ev.bidder || ev.bidderCode || null,
           adId: ev.adId || null
         };
-        SN.pbEvents.push(entry);
-        log('[SN][PB][bidWon]', entry);
+        pushPbEvent(elId, entry);
       });
     } catch (e) {
-      log('[SN][PB][attach_error]', e);
     }
   });
 
@@ -161,92 +194,5 @@
     try { pbjs.onEvent(evName, handler); } catch (e) { /* ignore */ }
   }
 
-  // ======= evaluation helpers =======
-  function effectiveSizeForRender(render) {
-    // Use GPT size unless null/1x1; then try Prebid near-in-time for same elId.
-    if (Array.isArray(render.size) && !is11(render.size)) return render.size;
-
-    const elId = render.elId || ''; const t = render.t; const WINDOW_MS = 5000;
-    let best = null;
-
-    // Prefer adRenderSucceeded
-    for (let i = SN.pbEvents.length - 1; i >= 0; i--) {
-      const ev = SN.pbEvents[i];
-      if (ev.elId !== elId) continue;
-      if (ev.type !== 'adRenderSucceeded') continue;
-      if (ev.size && Math.abs(ev.t - t) <= WINDOW_MS) { best = ev; break; }
-    }
-    // Fallback: bidWon
-    if (!best) {
-      for (let i = SN.pbEvents.length - 1; i >= 0; i--) {
-        const ev = SN.pbEvents[i];
-        if (ev.elId !== elId) continue;
-        if (ev.type !== 'bidWon') continue;
-        if (ev.size && Math.abs(ev.t - t) <= WINDOW_MS) { best = ev; break; }
-      }
-    }
-    return best ? best.size : render.size; // may still be null
-  }
-
-  function evaluate(events) {
-    const renders = events.filter(e => e.type === 'slotRenderEnded' && !e.isEmpty);
-
-    const enriched = renders.map(r => {
-      const eff = effectiveSizeForRender(r);
-      return { ...r, effectiveSize: eff, effectiveSizeStr: toStr(eff) };
-    });
-
-    // topscroll: rendered, regardless of size
-    const topscroll = enriched.filter(e =>
-      (e.path && e.path.toLowerCase().includes('topscroll')) ||
-      (e.elId && e.elId.includes(TOPSCROLL_TOKEN))
-    );
-
-    // interstitial: rendered (or onload) regardless of size
-    const interstitialRendered = enriched.filter(e =>
-      e.path && e.path.toLowerCase().includes(INTERSTITIAL_TOKEN)
-    );
-    const interstitialOnload = events.filter(e =>
-      e.type === 'slotOnload' &&
-      e.path && e.path.toLowerCase().includes(INTERSTITIAL_TOKEN)
-    );
-    const interstitial = interstitialRendered.concat(interstitialOnload);
-
-    // midscroll: by effective size
-    const midscroll = enriched.filter(e => Array.isArray(e.effectiveSize) && inAllow(e.effectiveSize));
-
-    return { topscroll, interstitial, midscroll, enriched };
-  }
-
-  // ======= flush (re-usable, returns summary) =======
-  function flush(reason = 'manual', opts = {}) {
-    const { clear = false } = opts;
-    const summary = evaluate(SN.gptEvents);
-
-    // call stubs
-    if (summary.topscroll.length)    topscrollEvent({ matches: summary.topscroll });
-    if (summary.interstitial.length) interstitialEvent({ matches: summary.interstitial });
-    if (summary.midscroll.length)    midscrollEvent({ matches: summary.midscroll });
-
-    log('[SN][Flush]', {
-      reason,
-      counts: {
-        topscroll: summary.topscroll.length,
-        interstitial: summary.interstitial.length,
-        midscroll: summary.midscroll.length
-      }
-    });
-
-    if (clear) {
-      SN.gptEvents.length = 0;
-      SN.pbEvents.length  = 0;
-      log('[SN][Flush][cleared]');
-    }
-
-    return summary; // so you can do: const r = SN.flush('manual'); console.log(r);
-  }
-
-  // ======= ONLY flush on pagehide (modern unload) =======
-  window.addEventListener('pagehide', () => SN.flush('pagehide', { clear:true }));
 })();
 </script>
