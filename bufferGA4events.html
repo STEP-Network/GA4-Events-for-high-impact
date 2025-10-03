@@ -4,6 +4,19 @@
 
   function log(){ if (DEBUG && window.console) console.log.apply(console, arguments); }
 
+  // Timing simplification: use only performance.now() so we never mix clocks.
+  // scriptPerfStart: when this script executed.
+  // domReadyPerf: set at DOMContentLoaded (or immediately if already fired).
+  const perf = (performance && performance.now) ? () => performance.now() : () => Date.now();
+  const scriptPerfStart = perf();
+  let domReadyPerf = null;
+  let topscrollLoadDeltaMs = null; // first computed delta (ms)
+  if (document.readyState === 'interactive' || document.readyState === 'complete') {
+    domReadyPerf = scriptPerfStart; // DOM already ready; baseline = script start
+  } else {
+    document.addEventListener('DOMContentLoaded', function () { if (domReadyPerf == null) domReadyPerf = perf(); }, { once: true });
+  }
+
   if (window.__SN_GPT_PREBID_BUFFER_ATTACHED__) return;
   window.__SN_GPT_PREBID_BUFFER_ATTACHED__ = true;
 
@@ -24,7 +37,7 @@
   const INTERSTITIAL_TOKEN = 'interstitial';
   const ALLOWED_MIDSCROLL_SIZES = [[300,240],[300,210],[970,570],[970,550],[970,540]];
 
-  const now = () => (performance && performance.now) ? Math.round(performance.now()) : Date.now();
+  const now = () => Math.round(perf());
   const sizeEq = (a,b) => Array.isArray(a)&&Array.isArray(b)&&a[0]===b[0]&&a[1]===b[1];
   const is11   = (a) => Array.isArray(a) && a[0] === 1 && a[1] === 1;
   const toStr  = (a) => Array.isArray(a) ? `${a[0]}x${a[1]}` : null;
@@ -111,6 +124,16 @@
       if (gptEventName === 'slotRenderEnded' && !base.isEmpty) {
         // topscroll
         if (lowerPath.includes('topscroll') || (base.elId && base.elId.includes(TOPSCROLL_TOKEN))) {
+          // Compute topscroll load delta only once (first render) relative to DOM ready.
+          if (topscrollLoadDeltaMs == null) {
+            const baseline = (domReadyPerf != null) ? Math.round(domReadyPerf) : Math.round(scriptPerfStart);
+            let delta = base.t - baseline;
+            if (delta < 0) delta = 0; // safety clamp
+            topscrollLoadDeltaMs = delta;
+          }
+          if (topscrollLoadDeltaMs != null) {
+            base.topscrollLoadMs = topscrollLoadDeltaMs;
+          }
           matches.push('topscroll');
         }
         // midscroll (by effective size)
